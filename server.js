@@ -1,24 +1,19 @@
-import express from "express";
+import express from 'express';
+import bodyParser from 'body-parser';
+
 const app = express();
-app.use(express.json());
+app.use(bodyParser.json());
 
-// Token bảo mật trùng với PayOS
-const WEBHOOK_TOKEN = "hethongsacxe";
-
-// Khi PayOS gửi dữ liệu thanh toán
-app.post("/api/payos/webhook", (req, res) => {
-  if (req.headers["x-payos-token"] !== WEBHOOK_TOKEN) {
-    return res.status(403).send("Invalid token");
-  }
-
-  console.log("💳 Giao dịch nhận:", req.body);
-  res.sendStatus(200);
+// Kiểm tra server
+app.get('/', (req, res) => {
+  res.send('✅ Webhook server đang hoạt động');
 });
 
-// Kiểm tra server hoạt động
-app.get("/", (req, res) => res.send("Webhook đang hoạt động 🚀"));
+// Webhook PayOS gửi dữ liệu vào đây
+app.post('/api/payos/webhook', (req, res) => {
+  console.log('📩 Nhận webhook từ PayOS:', req.body);
+  res.status(200).send('OK'); // trả về 200 để PayOS không báo lỗi
+});
 
-// Render sẽ tự set PORT
-app.listen(process.env.PORT || 3000, () =>
-  console.log("✅ Server webhook đang chạy...")
-);
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`✅ Server chạy tại cổng ${PORT}`));
