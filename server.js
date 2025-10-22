@@ -37,7 +37,7 @@ function buildPayOSSignature({ amount, cancelUrl, description, orderCode, return
   const dataString =
     `amount=${amount}` +
     `&cancelUrl=${cancelUrl}` +
-    `&description=${encodeURIComponent(description)}` +
+    `&description=${description}` +   // KHÔNG encodeURIComponent
     `&orderCode=${orderCode}` +
     `&returnUrl=${returnUrl}`;
   const hmac = CryptoJS.HmacSHA256(dataString, checksumKey);
