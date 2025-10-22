@@ -1,90 +1,211 @@
-// server.js — Hệ thống sạc xe điện + PayOS webhook (phiên bản dùng Blynk)
+import 'dotenv/config';
 import express from 'express';
-import fetch from 'node-fetch';
+import helmet from 'helmet';
 import cors from 'cors';
+import morgan from 'morgan';
+import axios from 'axios';
+import CryptoJS from 'crypto-js';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { nanoid } from 'nanoid';
 
+/* ============== Helpers ============== */
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const DB_PATH = path.join(__dirname, 'database/sessions.json');
+
+const logger = {
+  info: (...a) => console.log('[INFO]', ...a),
+  warn: (...a) => console.warn('[WARN]', ...a),
+  error: (...a) => console.error('[ERROR]', ...a),
+};
+
+function loadDB() {
+  try { return JSON.parse(fs.readFileSync(DB_PATH, 'utf-8')); }
+  catch { return []; }
+}
+function saveDB(rows) {
+  fs.writeFileSync(DB_PATH, JSON.stringify(rows, null, 2));
+}
+
+/** PayOS signature theo thứ tự key alphabet:
+ * amount, cancelUrl, description, orderCode, returnUrl
+ * format: amount=...&cancelUrl=...&description=...&orderCode=...&returnUrl=...
+ */
+function buildPayOSSignature({ amount, cancelUrl, description, orderCode, returnUrl }, checksumKey) {
+  const dataString =
+    `amount=${amount}` +
+    `&cancelUrl=${cancelUrl}` +
+    `&description=${encodeURIComponent(description)}` +
+    `&orderCode=${orderCode}` +
+    `&returnUrl=${returnUrl}`;
+  const hmac = CryptoJS.HmacSHA256(dataString, checksumKey);
+  return CryptoJS.enc.Hex.stringify(hmac);
+}
+
+/* ============== External services ============== */
+const PAYOS_BASE = 'https://api-merchant.payos.vn'; // production
+
+async function payosCreatePaymentLink({ orderCode, amount, description, returnUrl, cancelUrl, buyerEmail, buyerName }) {
+  const headers = {
+    'Content-Type': 'application/json',
+    'x-client-id': process.env.PAYOS_CLIENT_ID,
+    'x-api-key': process.env.PAYOS_API_KEY,
+  };
+  const signature = buildPayOSSignature(
+    { amount, cancelUrl, description, orderCode, returnUrl },
+    process.env.PAYOS_CHECKSUM_KEY
+  );
+  const payload = { orderCode, amount, description, buyerEmail, buyerName, cancelUrl, returnUrl, signature };
+
+  logger.info('[PayOS][Create] order=', orderCode, 'amount=', amount);
+  const { data } = await axios.post(`${PAYOS_BASE}/v2/payment-requests`, payload, { headers, timeout: 15000 });
+  return data; // { code, desc, data: { checkoutUrl, qrCode, ... } }
+}
+
+async function emailjsSendReceipt({ to_email, station, kwh, amount, order_code, paid_at }) {
+  const url = 'https://api.emailjs.com/api/v1.0/email/send';
+  const payload = {
+    service_id: process.env.EMAILJS_SERVICE_ID,
+    template_id: process.env.EMAILJS_TEMPLATE_ID,
+    user_id: process.env.EMAILJS_PUBLIC_KEY,
+    template_params: { to_email, station, kwh, amount, order_code, paid_at }
+  };
+  try {
+    const { data } = await axios.post(url, payload, { headers: { 'Content-Type': 'application/json' }, timeout: 15000 });
+    logger.info('[EmailJS] Sent OK to', to_email, '| order=', order_code);
+    return data;
+  } catch (err) {
+    logger.warn('[EmailJS] Send FAIL:', err?.response?.data || err.message);
+    return null; // không throw để webhook vẫn trả 200
+  }
+}
+
+async function blynkUpdate(pin, value) {
+  const token = process.env.BLYNK_TOKEN;
+  const url = `https://blynk.cloud/external/api/update?token=${token}&${pin}=${encodeURIComponent(value)}`;
+  try {
+    const { data } = await axios.get(url, { timeout: 8000 });
+    logger.info('[Blynk] Update', pin, '=', value, '->', data);
+    return data;
+  } catch (err) {
+    logger.warn('[Blynk] Update FAIL', pin, err?.response?.data || err.message);
+    return null;
+  }
+}
+
+/* ============== App init ============== */
 const app = express();
+app.use(helmet());
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
+app.use(morgan('dev'));
 
-// ====== CẤU HÌNH ======
-const CLIENT_ID = 'cec2681b-4257-4aa4-8e3b-974af9cf6ea5';
-const API_KEY = 'df48b405-e3aa-498f-b2a3-28042d756731';
-const CHECKSUM_KEY = '24a0011e0db99a0b892a1443b3827d73f583fa3fbf90765a8d384f9d1d6a5e23';
+/* Health check */
+app.get('/', (req, res) => res.json({ ok: true, name: 'EV Charging Server', time: new Date().toISOString() }));
+app.get('/healthz', (req, res) => res.status(200).send('ok'));
 
-// Blynk Cloud
-const BLYNK_TOKEN = 'Wsql9VzqLlV259XRmmsVf6aw2B0kkxn0';
-const BLYNK_URL = `https://blynk.cloud/external/api/update?token=${BLYNK_TOKEN}`;
-
-// ====== TRANG CHỦ ======
-app.get('/', (req, res) => {
-  res.send('✅ Hệ thống sạc xe điện webhook PayOS đang hoạt động.');
-});
-
-// ====== API TẠO MÃ QR THANH TOÁN ======
+/* ============== API: create payment ============== */
+/**
+ * POST /api/payment/create
+ * body: { station, uid, kWh, email }
+ */
 app.post('/api/payment/create', async (req, res) => {
   try {
-    const { kWh, user } = req.body;
-    const amount = Math.round(kWh * 5000); // ví dụ: 5.000đ/kWh
+    const { station, uid, kWh, email } = req.body || {};
+    if (![1, 2].includes(Number(station))) return res.status(400).json({ error: 'Invalid station' });
+    if (typeof kWh !== 'number' || kWh <= 0) return res.status(400).json({ error: 'Invalid kWh' });
 
-    const payload = {
-      orderCode: Date.now(),
-      amount,
-      description: `Thanh toán phí sạc cho ${user} (${kWh} kWh)`,
-      returnUrl: 'https://hethongsacxe.onrender.com/thankyou',
-      cancelUrl: 'https://hethongsacxe.onrender.com/cancel',
-    };
+    const unitPrice = parseInt(process.env.UNIT_PRICE || '5000', 10);
+    const amount = Math.round(kWh * unitPrice);
+    const orderCode = Number(`${Date.now().toString().slice(-9)}`); // integer ngắn gọn
+    const description = `EVSAC-S${station}-${uid?.slice(-4) || 'XXXX'}`;
+    const returnUrl = process.env.RETURN_URL || `${process.env.PUBLIC_BASE_URL}/success`;
+    const cancelUrl = process.env.CANCEL_URL || `${process.env.PUBLIC_BASE_URL}/cancel`;
 
-    const response = await fetch('https://api-merchant.payos.vn/v2/payment-requests', {
-      method: 'POST',
-      headers: {
-        'x-client-id': CLIENT_ID,
-        'x-api-key': API_KEY,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(payload),
+    const resp = await payosCreatePaymentLink({
+      orderCode, amount, description, returnUrl, cancelUrl,
+      buyerEmail: email, buyerName: uid || 'EV User'
     });
-
-    const data = await response.json();
-    console.log('✅ QR created:', data);
-
-    if (!data.data?.checkoutUrl) {
-      return res.status(400).json({ error: 'Không tạo được QR thanh toán' });
+    if (resp?.code !== '00') {
+      return res.status(500).json({ error: 'PayOS create failed', detail: resp });
     }
 
-    // Trả về cho ESP32 hoặc ứng dụng
-    res.json({
-      message: 'Tạo QR thành công',
-      amount,
-      qr: data.data.checkoutUrl,
+    const { data } = resp; // checkoutUrl, qrCode, status, orderCode
+    const rows = loadDB();
+    rows.push({
+      id: nanoid(8),
+      orderCode: data.orderCode || orderCode,
+      station, uid, kWh, amount, email,
+      status: data.status || 'PENDING',
+      createdAt: new Date().toISOString(),
+      paidAt: null
     });
+    saveDB(rows);
+
+    logger.info('[CREATE]', `S${station}`, 'UID:', uid, 'kWh:', kWh, '=>', amount, 'order=', orderCode);
+    return res.json({ checkoutUrl: data.checkoutUrl, qrCode: data.qrCode, amount });
   } catch (err) {
-    console.error('❌ Lỗi tạo QR:', err);
-    res.status(500).json({ error: 'Create QR failed' });
+    logger.error('CREATE error', err?.response?.data || err.message);
+    return res.status(500).json({ error: 'Server error' });
   }
 });
 
-// ====== API WEBHOOK PAYOS ======
+/* ============== API: PayOS webhook ============== */
+/**
+ * POST /api/payos/webhook
+ * body: { code, desc, success, data:{ orderCode, amount, transactionDateTime }, signature }
+ * Trả 200 OK ngay cả khi email lỗi → tránh retry dồn dập.
+ */
 app.post('/api/payos/webhook', async (req, res) => {
-  const data = req.body.data;
-  console.log('📩 Nhận webhook từ PayOS:', data);
-
-  // Kiểm tra giao dịch thành công
-  if (data?.code === '00' && data?.desc === 'Thành công') {
-    console.log('💰 Thanh toán thành công cho đơn:', data.orderCode);
-
-    // Gửi thông báo về Blynk
-    try {
-      await fetch(`${BLYNK_URL}&V1=Thanh toán thành công!`);
-      console.log('✅ Đã gửi thông báo tới Blynk');
-    } catch (err) {
-      console.error('❌ Lỗi gửi Blynk:', err);
+  const body = req.body || {};
+  try {
+    // TODO (nâng cao): verify signature webhook theo PayOS docs nếu cần.
+    const isPaid = (body?.code === '00' || body?.success === true) && body?.data?.orderCode;
+    if (!isPaid) {
+      logger.warn('[WEBHOOK] Ignored payload:', body?.code, body?.desc);
+      return res.status(200).json({ ok: true });
     }
-  }
 
-  res.status(200).send('OK');
+    const { orderCode, amount, transactionDateTime } = body.data;
+    const rows = loadDB();
+    const idx = rows.findIndex(r => String(r.orderCode) === String(orderCode));
+    if (idx === -1) {
+      logger.warn('[WEBHOOK] order not found:', orderCode);
+      return res.status(200).json({ ok: true });
+    }
+    if (rows[idx].status === 'PAID') {
+      logger.info('[WEBHOOK] Duplicate paid ignored:', orderCode);
+      return res.status(200).json({ ok: true });
+    }
+
+    rows[idx].status = 'PAID';
+    rows[idx].paidAt = new Date().toISOString();
+    saveDB(rows);
+    logger.info('[WEBHOOK] Paid OK | order=', orderCode, '| amount=', amount);
+
+    // EmailJS (không throw)
+    await emailjsSendReceipt({
+      to_email: rows[idx].email || '',
+      station: rows[idx].station,
+      kwh: rows[idx].kWh,
+      amount: rows[idx].amount,
+      order_code: rows[idx].orderCode,
+      paid_at: transactionDateTime || rows[idx].paidAt
+    });
+
+    // Blynk
+    await blynkUpdate('V11', 'PAID');
+    await blynkUpdate('V12', rows[idx].amount);
+
+    return res.status(200).json({ ok: true });
+  } catch (err) {
+    logger.error('[WEBHOOK] error:', err?.response?.data || err.message);
+    return res.status(200).json({ ok: true });
+  }
 });
 
-// ====== KHỞI CHẠY SERVER ======
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Server đang chạy trên cổng ${PORT}`));
+/* ============== Start server ============== */
+const port = process.env.PORT || 10000;
+app.listen(port, () => logger.info(`Server started : http://localhost:${port}`));
